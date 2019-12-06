@@ -1,5 +1,12 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"log"
+	"os"
+	"sort"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +51,51 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+
+	// Create a hash table to store the values that have the same key name
+	keyValueMap := make(map[string][]string)
+
+	// Read and decode the data from the intermediate file, then store in the hash table
+	for mapTask := 0; mapTask < nMap; mapTask++ {
+		filename := reduceName(jobName, mapTask, reduceTask)
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatal("Can't open the file: ", filename)
+		}
+		defer file.Close()
+
+		// func Decode() store the value in the value pointed to by keyValuePair
+		decoder := json.NewDecoder(file)
+		var keyValuePair KeyValue
+		for decoder.More() {
+			err := decoder.Decode(&keyValuePair)
+			if err != nil {
+				log.Fatal("Decode failed")
+			}
+			// one by one store the value that has same key in the hash table
+			keyValueMap[keyValuePair.Key] = append(keyValueMap[keyValuePair.Key], keyValuePair.Value)
+		}
+	}
+
+	// sort the key in increasing order
+	// keys is a slice to store
+	keys := make([]string, 0, len(keyValueMap))
+	for k := range keyValueMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// create the outfile, remember to close the file
+	f, err := os.Create(outFile)
+	if err != nil {
+		log.Fatal("Can't create the outfile: ", outFile)
+	}
+	defer f.Close()
+
+	// use json.NewEncoder() to write and encode the data into the outfile
+	// func reduce() is used to deal with values that have the same key
+	enc := json.NewEncoder(f)
+	for _, k := range keys {
+		_ = enc.Encode(KeyValue{k, reduceF(k, keyValueMap[k])})
+	}
 }
