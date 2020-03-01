@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
+	"labgob"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -106,6 +108,8 @@ func (rf *Raft) convertTo(s NodeState) {
 // one is heartbeat timeout that follower convert to the candidate
 // another is the candidate elects timeout and restart a new election.
 func (rf *Raft) startElection() {
+	defer rf.persist()
+
 	rf.currentTerm += 1 // term + 1
 
 	lastLogIndex := len(rf.log) - 1 // candidate's last log entry index
@@ -151,6 +155,7 @@ func (rf *Raft) startElection() {
 					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.convertTo(Follower)
+						rf.persist()
 					}
 				}
 				rf.mu.Unlock()
@@ -180,12 +185,15 @@ func (rf *Raft) broadcastHeartbeat() {
 
 			prevLogIndex := rf.nextIndex[server] - 1
 			// prepare the append rpc args
+			entries := make([]LogEntry, len(rf.log[prevLogIndex+1:]))
+			copy(entries, rf.log[prevLogIndex+1:])
+
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
 				PreLogIndex:  prevLogIndex,
 				PreLogTerm:   rf.log[prevLogIndex].Term,
-				Entries:      rf.log[rf.nextIndex[server]:],
+				Entries:      entries,
 				LeaderCommit: rf.commitIndex,
 			}
 			rf.mu.Unlock()
@@ -220,9 +228,21 @@ func (rf *Raft) broadcastHeartbeat() {
 					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.convertTo(Follower)
+						rf.persist()
 					} else {
 						// when the nextIndex is mismatch
-						rf.nextIndex[server]--
+						rf.nextIndex[server] = reply.ConflictIndex
+
+						if reply.ConflictTerm != -1 {
+							// if ConflictTerm isn't in the leader, set the nextIndex[server] to ConflictIndex
+							// else it shouldn't skip
+							for i := args.PreLogIndex; i >= 1; i-- {
+								if rf.log[i-1].Term == reply.ConflictTerm {
+									rf.nextIndex[server] = i
+									break
+								}
+							}
+						}
 					}
 				}
 				rf.mu.Unlock()
@@ -340,6 +360,15 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	// the paper has told us the persistent state
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	_ = e.Encode(rf.currentTerm)
+	_ = e.Encode(rf.votedFor)
+	_ = e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -362,6 +391,22 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	// recover the data
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, votedFor int
+	var logs []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		_, _ = DPrintf("%v fails to recover from persist", rf)
+		return
+	}
+
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log = logs
 }
 
 //
@@ -398,6 +443,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2A
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	// when candidate's term is smaller , or its term equal to candidate and has voted for another candidate
 	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && (rf.votedFor != -1 && rf.votedFor != args.CandidateId)) {
@@ -489,12 +535,17 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 2A
 	Success bool // 2A
+
+	// the term and index are used to implement the optimization
+	ConflictTerm  int // 2C the term of different log entries between follower and leader
+	ConflictIndex int // 2C the new log entry (nextIndex) that follower hopes the leader will resend
 }
 
 // AppendEntries RPC handler.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	// if the leader's term is smaller, return false
 	if args.Term < rf.currentTerm {
@@ -515,9 +566,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// second condition is in the same position, term isn't same,
 	// don't forget the first condition to avoid out of the index
 	// return currentTerm to help the leader adjusting the PreLogIndex
-	if len(rf.log) < args.PreLogIndex+1 || rf.log[args.PreLogIndex].Term != args.PreLogTerm {
+	if len(rf.log) < args.PreLogIndex+1 {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+
+		// 2C
+		// the first condition in the follower
+		// optimistically the leader contain all follower's entries that means follower is the subset of the leader
+		reply.ConflictIndex = len(rf.log)
+		// no conflict term
+		reply.ConflictTerm = -1
+		return
+	}
+
+	// 2C
+	// the second condition in the follower
+	if rf.log[args.PreLogIndex].Term != args.PreLogTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		// in the certain term, the follower's log mismatches the leader's
+		reply.ConflictTerm = rf.log[args.PreLogIndex].Term
+
+		conflictIndex := args.PreLogIndex
+		// if the pre entry index's term is equal to the ConflictTerm, decrease the index number
+		for rf.log[conflictIndex-1].Term == reply.ConflictTerm {
+			conflictIndex--
+		}
+		reply.ConflictIndex = conflictIndex
 		return
 	}
 
@@ -589,6 +664,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.nextIndex[rf.me] = index + 1
 		rf.matchIndex[rf.me] = index
 		_, _ = DPrintf("%v start command %d on the index %d", rf, command, index)
+		rf.persist()
 		rf.mu.Unlock()
 	}
 
@@ -668,7 +744,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}(rf)
 
 	// initialize from state persisted before a crash
+	rf.mu.Lock()
 	rf.readPersist(persister.ReadRaftState())
+	rf.mu.Unlock()
 
 	return rf
 }
